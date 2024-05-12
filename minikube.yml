@@ -1,0 +1,275 @@
+- hosts: minikube
+  connection: local
+  become: yes
+  gather_facts: True
+  vars:
+    cni_plugin_version: "v1.4.1"
+    cni_plugin_tar: "cni-plugins-linux-amd64-{{ cni_plugin_version }}.tgz"
+    cni_plugin_install_dir: "/opt/cni/bin"
+  tasks:
+    # Docker CE のインストール
+    - name: Add Docker GPG key
+      apt_key: url=https://download.docker.com/linux/ubuntu/gpg
+
+    - name: Add Docker APT repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable
+
+    - name: Install packages
+      apt:
+        name:
+          [
+            "apt-transport-https",
+            "ca-certificates",
+            "curl",
+            "software-properties-common",
+            "nfs-common",
+            "conntrack",
+          ]
+        state: present
+        update_cache: yes
+
+    - name: Install Docker-CE
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+
+    - name: usermod -aG docker vagrant
+      user:
+        name: vagrant
+        groups: docker
+
+    # カーネル設定変更
+    - name: Set sysctl
+      sysctl:
+        name: net.bridge.bridge-nf-call-iptables
+        value: 1
+        sysctl_set: yes
+        sysctl_file: /etc/sysctl.conf
+        state: present
+        reload: yes
+
+    # GlusterFS のインストール
+    - name: Install GlusterFS
+      apt:
+        name: glusterfs-client
+        state: present
+        update_cache: yes
+
+    # crictl のインストール
+    - name: Download crictl
+      ansible.builtin.get_url:
+        url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/crictl.tar.gz"
+        mode: "0755"
+      vars:
+        crictl_version: "v1.22.0"
+
+    - name: Extract crictl to /usr/local/bin
+      # become: yes
+      ansible.builtin.unarchive:
+        src: "/tmp/crictl.tar.gz"
+        dest: "/usr/local/bin"
+        remote_src: yes
+        # extra_opts: [--strip-components=1]
+
+    - name: Ensure crictl is executable
+      ansible.builtin.file:
+        path: "/usr/local/bin/crictl"
+        mode: "0755"
+
+    # kubectl コマンドのインストール
+    - name: download
+      get_url:
+        url: https://storage.googleapis.com/kubernetes-release/release/v1.18.0/bin/linux/amd64/kubectl
+        dest: /usr/local/bin/
+        mode: 0755
+        owner: root
+        group: root
+
+    - name: download
+      get_url:
+        url: https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        dest: /usr/local/bin/minikube
+        mode: 0755
+        owner: root
+        group: root
+
+    # GO のインストール
+    - name: Download Go binary archive
+      get_url:
+        url: "https://golang.org/dl/go1.22.1.linux-amd64.tar.gz"
+        dest: "/tmp/go1.22.1.linux-amd64.tar.gz"
+        timeout: 60
+
+    - name: Remove any previous Go installation
+      file:
+        path: "/usr/local/go"
+        state: absent
+
+    - name: Extract Go binary archive
+      unarchive:
+        src: "/tmp/go1.22.1.linux-amd64.tar.gz"
+        dest: "/usr/local"
+        remote_src: yes
+        creates: "/usr/local/go"
+
+    - name: Set Go path
+      lineinfile:
+        path: "/etc/profile.d/go.sh"
+        line: "export PATH=$PATH:/usr/local/go/bin"
+        create: yes
+
+    - name: Ensure profile script is executable
+      file:
+        path: "/etc/profile.d/go.sh"
+        mode: "0755"
+
+    - name: Check Go version
+      command: "/usr/local/go/bin/go version"
+      register: go_version
+      changed_when: false
+
+    - name: Show Go version
+      debug:
+        msg: "{{ go_version.stdout }}"
+
+    # Install cri-dockerd
+    - name: Install required packages for cri-dockerd
+      apt:
+        name:
+          - git
+          - make
+        state: present
+        update_cache: yes
+
+    - name: Clone cri-dockerd repository
+      git:
+        repo: "https://github.com/Mirantis/cri-dockerd.git"
+        dest: "/tmp/cri-dockerd"
+        version: "v0.3.11"
+
+    - name: Ensure bin directory exists
+      file:
+        path: "/tmp/cri-dockerd"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure bin directory exists
+      file:
+        path: "/tmp/cri-dockerd/bin"
+        state: directory
+        mode: "0755"
+
+    - name: Install cri-dockerd
+      shell: |
+        go get && go build -o bin/cri-dockerd &&
+        install -o root -g root -m 0755 bin/cri-dockerd /usr/local/bin/cri-dockerd &&
+        install packaging/systemd/* /etc/systemd/system &&
+        sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+      args:
+        executable: /bin/bash
+        chdir: "/tmp/cri-dockerd"
+      environment:
+        PATH: "/usr/local/go/bin:{{ ansible_env.PATH }}"
+
+    - name: Reload systemd and enable cri-docker socket
+      systemd:
+        daemon_reload: yes
+        name: cri-docker.socket
+        enabled: yes
+        state: started
+
+    # containernetworking-plugins install
+    - name: Download CNI plugins
+      ansible.builtin.get_url:
+        url: "https://github.com/containernetworking/plugins/releases/download/{{ cni_plugin_version }}/{{ cni_plugin_tar }}"
+        dest: "/tmp/{{ cni_plugin_tar }}"
+
+    - name: Create CNI plugin install directory
+      ansible.builtin.file:
+        path: "{{ cni_plugin_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Extract CNI plugins
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ cni_plugin_tar }}"
+        dest: "{{ cni_plugin_install_dir }}"
+        remote_src: yes
+
+    - name: Remove the CNI plugin tar file
+      ansible.builtin.file:
+        path: "/tmp/{{ cni_plugin_tar }}"
+        state: absent
+    - name: Ensure CNI config directory exists
+      file:
+        path: /etc/cni/net.d
+        state: directory
+        mode: "0755"
+
+    - name: Deploy CNI network configuration
+      copy:
+        content: |
+          {
+            "cniVersion": "0.4.0",
+            "name": "mynetwork",
+            "type": "bridge",
+            "bridge": "cnibr0",
+            "isGateway": true,
+            "ipMasq": true,
+            "ipam": {
+              "type": "host-local",
+              "subnet": "10.22.0.0/16",
+              "routes": [{"dst": "0.0.0.0/0"}]
+            }
+          }
+        dest: "/etc/cni/net.d/10-mynetwork.conf"
+
+    # Start Minikube
+    - name: start Minikube temporary
+      command: /usr/local/bin/minikube start --vm-driver none
+      args:
+        chdir: /root
+      register: mini
+
+    # Wait start containers
+    - name: waiting
+      command: sleep 30
+
+    ## move .minikube and .kube
+    #
+    #- name: cp /root/.kube  /home/vagrant/.kube
+    #  copy:
+    #    src: /root/.kube
+    #    dest: /home/vagrant/.kube
+    #    owner: vagrant
+    #    group: vagrant
+    #    mode: 0755
+
+    #- name: cp /root/.minikube  /home/vagrant/.minikube
+    #  copy:
+    #    src: /root/.minikube
+    #    dest: /home/vagrant/.minikube
+    #    owner: vagrant
+    #    group: vagrant
+    #    mode: 0755
+
+    - shell: mv /root/.kube /home/vagrant/.kube
+    - shell: chown -R vagrant:vagrant /home/vagrant/.kube
+
+    - shell: mv /root/.minikube /home/vagrant/.minikube
+    - shell: chown -R vagrant:vagrant /home/vagrant/.minikube
+
+    - name: change path
+      command: sed -i -e 's|root|home\/vagrant|g' /home/vagrant/.kube/config
+
+  ## restart minikube under /home/vagrant
+  #
+  #- name: restart minikube
+  #  become: yes
+  #  become_user: vagrant
+  #  command: sudo /usr/local/bin/minikube start --vm-driver none
+  #  args:
+  #    chdir: /home/vagrant
