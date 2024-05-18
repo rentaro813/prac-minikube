@@ -2,7 +2,7 @@
 minikube環境構築用のVagrantとAnsible資材
 
 # 前提
-Vagrant と Oracle Virtual Box がホストマシンにインストール済みであること
+1. Vagrant と Oracle Virtual Box がホストマシンにインストール済みであること
 
 # 構築手順
 ```
